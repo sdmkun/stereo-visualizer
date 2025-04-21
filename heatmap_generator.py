@@ -12,8 +12,8 @@ import threading # 音声再生の停止管理用に使うかも
 warnings.filterwarnings('ignore', category=RuntimeWarning)
 
 # --- 設定 ---
-INPUT_AUDIO_PATH = 'she-chiptune_superstar.wav' # ★要変更: 入力するステレオ音声ファイルのパス
-OUTPUT_VIDEO_PATH = 'output_heatmap.mp4' # ★要変更: 出力する動画ファイルのパス
+INPUT_AUDIO_PATH = 'resources/Loop Set 07 075 BPM F Minor Stereo Mix.wav' # ★要変更: 入力するステレオ音声ファイルのパス
+# OUTPUT_VIDEO_PATH = 'resources/output_heatmap.mp4' # ★要変更: 出力する動画ファイルのパス
 
 # STFTパラメータ
 N_PERSEG = 1024  # FFTのポイント数（周波数解像度）
@@ -21,9 +21,9 @@ N_OVERLAP = N_PERSEG // 2 # オーバーラップさせるサンプル数（時�
 WINDOW = 'hann' # 窓関数
 
 # ヒートマップ・動画パラメータ
-N_PAN_BINS = 3 # パンの分割数（仮実装用: 0=Left, 1=Center, 2=Right）
-PAN_LABELS = ['Left', 'Center', 'Right'] # パン軸のラベル
-TARGET_FPS = 30 # 動画のフレームレート
+N_PAN_BINS = 51 # パンの分割数
+PAN_LABELS = range(-25, 26) # パン軸のラベル
+TARGET_FPS = 60 # 動画のフレームレート
 CMAP = 'magma' # ヒートマップの色
 DB_RANGE = 60 # 表示するダイナミックレンジ（dB）
 # --- 設定ここまで ---
@@ -50,41 +50,82 @@ n_freqs = len(freqs)
 n_times = len(times)
 print(f"周波数ビン数: {n_freqs}, 時間フレーム数: {n_times}")
 
-print("ヒートマップデータを計算中（仮のパン分布）...")
+# --- Step 3: 全フレームのヒートマップデータ計算 (改良版) ---
+print("ヒートマップデータを計算中（改良版パン分布）...")
+
+# ★★★ N_PAN_BINS をスクリプト上部で 3 より大きい奇数に設定しておく (例: 21) ★★★
+if N_PAN_BINS <= 3:
+    print("警告: N_PAN_BINS が小さいです。より詳細なパン分布のためには 5 以上 (奇数がおすすめ) に設定してください。")
+
 # [周波数ビン数, パンビン数, 時間フレーム数] の配列を初期化
 all_heatmap_data = np.zeros((n_freqs, N_PAN_BINS, n_times))
 
+# パンビンの中心位置を計算 (-1.0 = 左端, 0.0 = 中央, +1.0 = 右端)
+pan_bin_centers = np.linspace(-1.0, 1.0, N_PAN_BINS)
+
+# エネルギーを分布させる際の「幅」を決めるパラメータ (標準偏差 sigma)
+# 値が小さいほどパンニングがシャープに、大きいほどボケた感じになる。
+# 例えば、隣のビンまでの距離の半分、とかを目安に調整してみる。
+bin_width = 2.0 / (N_PAN_BINS - 1) if N_PAN_BINS > 1 else 1.0
+sigma = bin_width * 1.0  # ★調整ポイント: ここの係数 (今は 1.0) を変えて広がりを調整
+
+print(f"パンビン数: {N_PAN_BINS}, 分布の標準偏差 sigma: {sigma:.3f}")
+
+# 各時間、各周波数で計算
 for t in range(n_times):
     for f in range(n_freqs):
         L = Zxx_L[f, t] # 左チャンネルの複素数値
         R = Zxx_R[f, t] # 右チャンネルの複素数値
 
-        # Mid/Side 計算
-        M = (L + R) / 2.0
-        S = (L - R) / 2.0
+        # 振幅 (Magnitude) を計算 (ゼロ除算等を回避するため微小値 epsilon を追加)
+        epsilon = 1e-10
+        mag_L = np.abs(L) + epsilon
+        mag_R = np.abs(R) + epsilon
 
-        # パワー計算 (|複素数|^2)
-        P_M = np.abs(M)**2
-        P_S = np.abs(S)**2
+        # --- 1. レベル比からパン位置 p (-1 to +1) を推定 ---
+        # 定位法則 (ここでは Constant Power Pan Law を想定) の逆算を試みる
+        # 角度 phi = arctan(|R|/|L|) を計算 (範囲は 0 から pi/2)
+        phi = np.arctan(mag_R / mag_L)
+        # パン位置 p = 1 - 4*phi/pi で推定 (-1 が左、+1 が右)
+        p = 1.0 - (4.0 / np.pi) * phi
+        # 念のため範囲をクリップ (-1 から 1 の間)
+        p = np.clip(p, -1.0, 1.0)
+        # (完全に L のみなら p=-1, R のみなら p=1 になるはず)
 
-        # --- 仮のパン分布マッピング (3 Bins) ---
-        # ここはもっと洗練させられるけど、今回はシンプルに
-        all_heatmap_data[f, 0, t] = P_S / 2.0 # Left Bin (Side成分の半分)
-        all_heatmap_data[f, 1, t] = P_M       # Center Bin (Mid成分)
-        all_heatmap_data[f, 2, t] = P_S / 2.0 # Right Bin (Side成分の半分)
-        # --- ここまで ---
+        # --- 2. 総エネルギー (Power) を計算 ---
+        # 振幅から計算
+        P_total = mag_L**2 + mag_R**2
 
-# dBスケールに変換 & 正規化
-# 微小値を足して log10(0) を回避
-all_heatmap_data_db = 10 * np.log10(all_heatmap_data + 1e-10)
+        # --- 3. 推定位置 p を中心にエネルギーを分布させる (ガウス分布を使用) ---
+        # 各パンビン中心でのガウス分布の値を計算 (高さは後で正規化するので気にしない)
+        # weights = exp( -(x - mu)^2 / (2*sigma^2) )
+        weights = np.exp(-((pan_bin_centers - p)**2) / (2 * sigma**2))
 
-# 全体の最大値を基準にする
+        # 重みの合計がゼロにならないように微小値を追加して正規化
+        sum_weights = np.sum(weights) + epsilon
+        normalized_weights = weights / sum_weights
+
+        # 計算された重みに従って、総エネルギーを各パンビンに割り当てる
+        all_heatmap_data[f, :, t] = P_total * normalized_weights
+
+# --- ここまでが改良版の計算ロジック ---
+
+# dBスケール変換 & 正規化 (この後の処理は前回と同じ)
+print("dB変換と正規化を実行中...")
+all_heatmap_data_db = 10 * np.log10(all_heatmap_data + 1e-10) # 微小値追加を忘れずに
+
+# (前回同様に max_db, min_db を計算してクリップする処理がここに入る)
 max_db = np.max(all_heatmap_data_db)
-min_db = max_db - DB_RANGE # 表示する最小dB値
+# もし完全に無音の部分がある場合、max_db が -inf に近い値になる可能性があるので対処
+if not np.isfinite(max_db):
+    print("警告: 計算結果がほぼ無音のため、最大dB値が不定です。デフォルト範囲を使用します。")
+    max_db = 0 # 仮の最大値
+min_db = max_db - DB_RANGE
+print(f"表示dB範囲: {min_db:.1f} dB to {max_db:.1f} dB")
 
-# min_db と max_db の間でクリップ（範囲外の値を丸める）
 all_heatmap_data_db_clipped = np.clip(all_heatmap_data_db, min_db, max_db)
 print("ヒートマップデータ計算完了.")
+# --- Step 3 ここまで ---
 
 # --- 音声再生と同期のための準備 ---
 current_audio_frame = 0 # 現在再生中のオーディオフレーム位置
